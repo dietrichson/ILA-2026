@@ -1,38 +1,38 @@
 # =============================================================================
 # 01-collect-commoncrawl.R
 # =============================================================================
-# Collects web page text from Common Crawl archives via the CC Index API and
-# WARC files stored on S3.
+# Collects web page text from Common Crawl archives via representative
+# sampling of the CC Index API (no domain restriction).
 #
-# For each combination of year and domain, this script:
-#   1. Retrieves the list of available Common Crawl crawl indexes.
-#   2. Matches each year to one or more crawl index IDs.
-#   3. Queries the CC Index API for pages matching the domain.
-#   4. Randomly samples SAMPLE_SIZE URLs from the results.
-#   5. Fetches the raw WARC record from S3 using byte-range requests.
-#   6. Decompresses and parses the WARC record to extract HTML.
-#   7. Extracts plain text using rvest.
-#   8. Saves a combined tibble to data/processed/ (.rds and metadata .csv).
+# For each year, this script:
+#   1. Checks SQLite for already-collected samples (resume support).
+#   2. Finds the matching crawl ID from collinfo.json.
+#   3. Picks random TLD prefixes and random page numbers for representative sampling.
+#   5. Randomly samples SAMPLE_SIZE records.
+#   6. Fetches each WARC record from S3 via byte-range request.
+#   7. Parses WARC -> HTML -> plain text.
+#   8. Inserts each result immediately into SQLite.
 #
 # Usage (from project root):
 #   Rscript R/01-collect-commoncrawl.R
 #
 # Output:
-#   data/raw/commoncrawl/               Raw per-page text files (gitignored)
-#   data/processed/commoncrawl_sample.rds       Full tibble with text
-#   data/processed/commoncrawl_metadata.csv     Metadata without text column
+#   data/processed/web_archive_samples.db     SQLite database (shared with WB script)
+#   data/processed/commoncrawl_sample.rds     Full tibble with text
+#   data/processed/commoncrawl_metadata.csv   Metadata without text column
 #
 # Notes:
 #   - Common Crawl data is available from approximately 2008 onward.
-#   - Early years (2008-2012) may have very limited coverage for some domains.
 #   - WARC records are gzip-compressed; memDecompress() is used to extract HTML.
+#   - Sampling is not domain-specific; pages are drawn from the full crawl.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # 0. Package checks
 # -----------------------------------------------------------------------------
 
-required_packages <- c("tidyverse", "httr2", "rvest", "jsonlite", "here")
+required_packages <- c("tidyverse", "httr2", "rvest", "jsonlite", "here",
+                       "DBI", "RSQLite")
 
 missing_packages <- required_packages[
   !sapply(required_packages, requireNamespace, quietly = TRUE)
@@ -54,41 +54,113 @@ suppressPackageStartupMessages({
   library(rvest)
   library(jsonlite)
   library(here)
+  library(DBI)
+  library(RSQLite)
 })
 
 # -----------------------------------------------------------------------------
 # 1. Configuration
 # -----------------------------------------------------------------------------
 
-SAMPLE_SIZE <- 1  # Number of random pages to retrieve per year per domain
+SAMPLE_SIZE        <- 1   # Pages per year (total, not per domain)
 
-set.seed(2026)    # For reproducibility of random sampling
+set.seed(2026)
 
-TARGET_DOMAINS <- c(
-  "nytimes.com",
-  "bbc.co.uk",
-  "cnn.com",
-  "washingtonpost.com",
-  "theguardian.com"
+YEARS              <- 2008:2026  # Common Crawl begins ~2008
+
+PROCESSED_DIR      <- here("data", "processed")
+DB_PATH            <- here("data", "processed", "web_archive_samples.db")
+
+CC_COLLINFO_URL    <- "https://index.commoncrawl.org/collinfo.json"
+CC_INDEX_BASE      <- "https://index.commoncrawl.org"
+CC_S3_BASE         <- "https://data.commoncrawl.org"
+
+DELAY_SECONDS      <- 1   # Polite delay between HTTP requests
+N_RANDOM_PAGES     <- 5   # Random TLD+page combinations to try per year
+
+# URL prefixes for TLD-based random sampling
+URL_PREFIXES <- c(
+  "*.com", "*.org", "*.net", "*.edu", "*.gov",
+  "*.co.uk", "*.de", "*.fr", "*.jp", "*.br",
+  "*.in", "*.ru", "*.au", "*.ca", "*.it"
 )
 
-YEARS <- 2008:2026  # Common Crawl begins ~2008
-
-OUTPUT_DIR <- here("data", "raw", "commoncrawl")
-
-PROCESSED_DIR <- here("data", "processed")
-
-CC_COLLINFO_URL <- "https://index.commoncrawl.org/collinfo.json"
-CC_INDEX_BASE   <- "https://index.commoncrawl.org"
-CC_S3_BASE      <- "https://data.commoncrawl.org"
-
-DELAY_SECONDS <- 1  # Polite delay between HTTP requests
-
 # -----------------------------------------------------------------------------
-# 2. Helper functions
+# 2. Database helpers
 # -----------------------------------------------------------------------------
 
-#' Safely parse HTML content string, avoiding xml2 path confusion.
+#' Open (or create) the shared SQLite database and ensure tables exist.
+#'
+#' @return A DBI connection object.
+init_db <- function() {
+  con <- dbConnect(SQLite(), DB_PATH)
+
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS wayback_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      timestamp TEXT,
+      original_url TEXT,
+      wayback_url TEXT,
+      text TEXT,
+      text_length INTEGER,
+      fetch_status TEXT NOT NULL,
+      collected_at TEXT,
+      UNIQUE(year, domain, timestamp, original_url)
+    )
+  ")
+
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS commoncrawl_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year INTEGER NOT NULL,
+      crawl_id TEXT,
+      shard_id INTEGER,
+      original_url TEXT,
+      text TEXT,
+      text_length INTEGER,
+      languages TEXT,
+      fetch_status TEXT NOT NULL,
+      collected_at TEXT,
+      UNIQUE(year, crawl_id, original_url)
+    )
+  ")
+
+  con
+}
+
+#' Count successful samples already in the database for a given year.
+#'
+#' @param con   DBI connection
+#' @param year  Four-digit integer year
+#' @return Integer count of successful rows.
+get_completed_count <- function(con, year) {
+  dbGetQuery(con,
+    "SELECT COUNT(*) AS n FROM commoncrawl_samples
+     WHERE year = ? AND fetch_status = 'success'",
+    params = list(year)
+  )$n
+}
+
+#' Export the commoncrawl_samples table to RDS and CSV.
+#'
+#' @param con       DBI connection
+#' @param rds_path  Path for the .rds output
+#' @param csv_path  Path for the .csv output (text column excluded)
+export_results <- function(con, rds_path, csv_path) {
+  results <- dbGetQuery(con, "SELECT * FROM commoncrawl_samples")
+  results_tbl <- as_tibble(results)
+  saveRDS(results_tbl, rds_path)
+  write_csv(select(results_tbl, -text), csv_path)
+  message("Exported ", nrow(results_tbl), " rows to RDS and CSV.")
+}
+
+# -----------------------------------------------------------------------------
+# 3. Fetch helpers
+# -----------------------------------------------------------------------------
+
+#' Safely parse an HTML content string, avoiding xml2 path confusion.
 #'
 #' @param content  Character string of raw HTML
 #' @return An xml_document, or NULL on failure.
@@ -103,7 +175,7 @@ safe_read_html <- function(content) {
   )
 }
 
-#' Fetch and cache the list of available Common Crawl indexes.
+#' Fetch and return the list of available Common Crawl crawl indexes.
 #'
 #' @return A tibble with columns: id, name, timegate, cdx-api (and others).
 get_crawl_index_list <- function() {
@@ -112,98 +184,132 @@ get_crawl_index_list <- function() {
   tryCatch({
     resp <- request(CC_COLLINFO_URL) |>
       req_timeout(60) |>
+      req_retry(max_tries = 3, backoff = ~ 2) |>
       req_headers("User-Agent" = "ILA2026-Research/1.0 (academic research)") |>
       req_perform()
 
-    fromJSON(resp_body_string(resp)) |>
-      as_tibble()
+    fromJSON(resp_body_string(resp)) |> as_tibble()
   }, error = function(e) {
     stop("Failed to fetch CC index list: ", conditionMessage(e))
   })
 }
 
-#' Select crawl IDs that correspond to a given year.
+#' Select the crawl ID that corresponds to a given year.
 #'
-#' CC crawl IDs follow the pattern "CC-MAIN-YYYY-WW" where YYYY is the year
-#' and WW is the week number. Early crawls may use "CC-MAIN-YYYY" (no week).
-#' We match on the year portion without a trailing dash to catch both formats.
+#' CC crawl IDs follow the pattern "CC-MAIN-YYYY-WW". Early crawls may use
+#' "CC-MAIN-YYYY" (no week). We match on "CC-MAIN-YYYY" without a trailing
+#' dash to catch both formats.
 #'
 #' @param crawl_list  Tibble returned by get_crawl_index_list()
 #' @param year        Four-digit integer year
-#' @return Character vector of matching crawl IDs (may be empty)
-find_crawls_for_year <- function(crawl_list, year) {
-  # Match both "CC-MAIN-YYYY-WW" (standard) and "CC-MAIN-YYYY" (old format)
-  pattern <- paste0("CC-MAIN-", year)
-  matching <- crawl_list |>
-    filter(str_detect(id, pattern))
-
-  if (nrow(matching) == 0) return(character(0))
-
-  # Return just the first (newest) crawl to reduce API calls
+#' @return A single crawl ID string, or NA if none found.
+find_crawl_for_year <- function(crawl_list, year) {
+  pattern  <- paste0("CC-MAIN-", year)
+  matching <- crawl_list |> filter(str_detect(id, pattern))
+  if (nrow(matching) == 0) return(NA_character_)
   matching$id[1]
 }
 
-#' Query the CC Index API for pages matching a domain in a specific crawl.
+#' Fetch one page of CC index results and return parsed records.
 #'
-#' @param crawl_id  CC crawl identifier, e.g. "CC-MAIN-2020-16"
-#' @param domain    Domain string, e.g. "nytimes.com"
-#' @return A tibble of index records, or an empty tibble on failure/no results.
-query_cc_index <- function(crawl_id, domain) {
-  index_url <- paste0(CC_INDEX_BASE, "/", crawl_id, "-index")
+#' @param crawl_id   CC crawl identifier
+#' @param url_query  URL pattern to query (e.g. "*" or "*.com")
+#' @param page_num   Zero-based page number
+#' @return A list of parsed JSON record objects (may be empty).
+fetch_index_page <- function(crawl_id, url_query, page_num) {
+  Sys.sleep(DELAY_SECONDS)
 
   tryCatch({
-    Sys.sleep(DELAY_SECONDS)
-
-    resp <- request(index_url) |>
+    resp <- request(paste0(CC_INDEX_BASE, "/", crawl_id, "-index")) |>
       req_url_query(
-        url    = paste0("*.", domain),
+        url    = url_query,
         output = "json",
-        limit  = 1000,
-        filter = "mime:text/html"
+        page   = page_num,
+        filter = "mime:text/html",
+        filter = "status:200",
+        .multi = "explode"
       ) |>
       req_timeout(60) |>
+      req_retry(max_tries = 3, backoff = ~ 2) |>
       req_headers("User-Agent" = "ILA2026-Research/1.0 (academic research)") |>
       req_perform()
 
-    body <- resp_body_string(resp)
-
-    # CC index returns newline-delimited JSON (one object per line)
+    body  <- resp_body_string(resp)
     lines <- str_split(str_trim(body), "\n")[[1]]
     lines <- lines[nzchar(lines)]
-
-    if (length(lines) == 0) {
-      return(tibble())
-    }
-
-    records <- map(lines, function(line) {
-      tryCatch(fromJSON(line), error = function(e) NULL)
-    })
-    records <- compact(records)
-
-    bind_rows(records)
+    compact(lapply(lines, function(l) tryCatch(fromJSON(l), error = function(e) NULL)))
   }, error = function(e) {
-    message("  [CC INDEX ERROR] ", crawl_id, " / ", domain, ": ",
+    message("  [CC INDEX ERROR] ", crawl_id, " page ", page_num, ": ",
             conditionMessage(e))
-    tibble()
+    list()
   })
 }
 
-#' Fetch a WARC record from Common Crawl S3 storage using a byte-range request.
+#' Get available records using TLD-based random pagination.
 #'
-#' @param filename  S3 path from the CC index, e.g. "crawl-data/CC-MAIN-.../...warc.gz"
-#' @param offset    Byte offset of the WARC record in the file (integer/numeric)
-#' @param length    Byte length of the WARC record (integer/numeric)
-#' @return Raw bytes of the (compressed) WARC record, or NULL on failure.
+#' For each attempt, picks a random TLD prefix, gets total pages,
+#' picks a random page, and fetches records from it.
+#'
+#' @param crawl_id        CC crawl identifier
+#' @param n_attempts      Number of random pages to try across different TLDs
+#' @return A list of parsed index records.
+fetch_records_random <- function(crawl_id, n_attempts) {
+  records <- list()
+
+  for (i in seq_len(n_attempts)) {
+    # Pick a random prefix
+    prefix <- sample(URL_PREFIXES, 1)
+
+    # Get page count for this prefix
+    total_pages <- tryCatch({
+      resp <- request(paste0(CC_INDEX_BASE, "/", crawl_id, "-index")) |>
+        req_url_query(url = prefix, showNumPages = "true", output = "json") |>
+        req_timeout(60) |>
+        req_retry(max_tries = 3, backoff = ~ 2) |>
+        req_headers("User-Agent" = "ILA2026-Research/1.0 (academic research)") |>
+        req_perform()
+      parsed <- tryCatch(fromJSON(resp_body_string(resp)), error = function(e) NULL)
+      if (is.list(parsed) && "pages" %in% names(parsed)) as.integer(parsed$pages) else NA_integer_
+    }, error = function(e) {
+      message("  [PAGE COUNT ERROR] ", prefix, ": ", conditionMessage(e))
+      NA_integer_
+    })
+
+    if (is.na(total_pages) || total_pages == 0) {
+      message("  [SKIP] No pages for prefix ", prefix)
+      next
+    }
+
+    # Pick random page
+    random_page <- sample(0:(total_pages - 1), 1)
+    message("  Querying ", prefix, " page ", random_page, " of ", total_pages)
+
+    page_records <- fetch_index_page(crawl_id, prefix, random_page)
+    records <- c(records, page_records)
+
+    if (length(records) >= SAMPLE_SIZE * 10) break  # enough candidates
+  }
+
+  records
+}
+
+#' Fetch a WARC record from Common Crawl S3 using a byte-range request.
+#'
+#' @param filename  S3 path, e.g. "crawl-data/CC-MAIN-.../...warc.gz"
+#' @param offset    Byte offset of the WARC record
+#' @param length    Byte length of the WARC record
+#' @return Raw bytes of the compressed WARC record, or NULL on failure.
 fetch_warc_record_bytes <- function(filename, offset, length) {
-  s3_url     <- paste0(CC_S3_BASE, "/", filename)
-  byte_end   <- as.numeric(offset) + as.numeric(length) - 1
+  s3_url       <- paste0(CC_S3_BASE, "/", filename)
+  byte_end     <- as.numeric(offset) + as.numeric(length) - 1
   range_header <- paste0("bytes=", offset, "-", byte_end)
 
-  tryCatch({
-    Sys.sleep(DELAY_SECONDS)
+  Sys.sleep(DELAY_SECONDS)
 
+  tryCatch({
     resp <- request(s3_url) |>
       req_timeout(60) |>
+      req_retry(max_tries = 3, backoff = ~ 2) |>
       req_headers(
         "Range"      = range_header,
         "User-Agent" = "ILA2026-Research/1.0 (academic research)"
@@ -218,38 +324,28 @@ fetch_warc_record_bytes <- function(filename, offset, length) {
   })
 }
 
-#' Decompress gzip-compressed WARC bytes and extract the HTTP response body.
+#' Decompress gzip WARC bytes and extract the HTTP response body (HTML).
 #'
-#' A WARC record has the structure:
-#'   WARC/1.0 header block
-#'   <blank line>
-#'   HTTP/1.x header block
-#'   <blank line>
+#' WARC structure:
+#'   WARC/1.0 header block  <blank line>
+#'   HTTP/1.x header block  <blank line>
 #'   HTML body
 #'
 #' @param raw_bytes  Raw vector of gzip-compressed WARC data
 #' @return Character string of HTML content, or NA on failure.
 parse_warc_html <- function(raw_bytes) {
   tryCatch({
-    # Decompress gzip data
     decompressed <- memDecompress(raw_bytes, type = "gzip")
     text_raw     <- rawToChar(decompressed)
 
-    # Split into lines (handle both \r\n and \n)
-    lines <- str_split(text_raw, "\\r?\\n")[[1]]
-
-    # Find the blank line separating WARC headers from HTTP response
+    lines      <- str_split(text_raw, "\\r?\\n")[[1]]
     warc_blank <- which(lines == "")[1]
     if (is.na(warc_blank)) return(NA_character_)
 
-    # The HTTP response starts after the WARC header block
     http_lines <- lines[(warc_blank + 1):length(lines)]
-
-    # Find the blank line separating HTTP headers from body
     http_blank <- which(http_lines == "")[1]
     if (is.na(http_blank)) return(NA_character_)
 
-    # Everything after the second blank line is the HTML body
     body_lines <- http_lines[(http_blank + 1):length(http_lines)]
     paste(body_lines, collapse = "\n")
   }, error = function(e) {
@@ -261,200 +357,188 @@ parse_warc_html <- function(raw_bytes) {
 #' Extract plain text from an HTML string using rvest.
 #'
 #' @param html_string  Character string of raw HTML
-#' @return Cleaned plain text string, or NA if parsing fails or text is empty.
+#' @return Cleaned plain text, or NA if parsing fails or text is empty.
 extract_text_from_html <- function(html_string) {
   if (is.na(html_string) || !nzchar(html_string)) return(NA_character_)
-
   doc <- safe_read_html(html_string)
-
   if (is.null(doc)) return(NA_character_)
-
   tryCatch({
     xml2::xml_remove(html_nodes(doc, "script"))
     xml2::xml_remove(html_nodes(doc, "style"))
     text <- doc |> html_text2() |> str_squish()
     if (!nzchar(text)) NA_character_ else text
   }, error = function(e) {
-    message("  [HTML PARSE ERROR]: ", conditionMessage(e))
+    message("  [TEXT EXTRACT ERROR]: ", conditionMessage(e))
     NA_character_
   })
 }
 
-#' Process one year/domain combination across all matching crawls for that year.
+# -----------------------------------------------------------------------------
+# 4. Per-year collector (writes directly to DB)
+# -----------------------------------------------------------------------------
+
+#' Process one year: sample from CC index and insert results into SQLite.
 #'
-#' @param year        Four-digit integer year
-#' @param domain      Domain string
-#' @param crawl_list  Full tibble of available crawl indexes
-#' @return A tibble of results for this combination
-collect_year_domain <- function(year, domain, crawl_list) {
-  message("Fetching year ", year, ", domain ", domain, "...")
-
-  crawl_ids <- find_crawls_for_year(crawl_list, year)
-
-  if (length(crawl_ids) == 0) {
-    message("  No crawl indexes found for year ", year, ".")
-    return(tibble(
-      year         = integer(),
-      domain       = character(),
-      crawl_id     = character(),
-      original_url = character(),
-      text         = character(),
-      fetch_status = character()
-    ))
+#' @param con        DBI connection
+#' @param year       Four-digit integer year
+#' @param crawl_id   CC crawl identifier for this year
+collect_year <- function(con, year, crawl_id) {
+  # Resume check
+  already <- get_completed_count(con, year)
+  if (already >= SAMPLE_SIZE) {
+    message("  Skipping year ", year,
+            " (", already, " successful samples already in DB)")
+    return(invisible(NULL))
   }
 
-  message("  Found ", length(crawl_ids), " crawl(s): ",
-          paste(crawl_ids, collapse = ", "))
+  message("Processing year ", year, " (", crawl_id, ")...")
 
-  # Collect index records from all matching crawls and pool them
-  all_records <- map(crawl_ids, function(cid) {
-    recs <- query_cc_index(cid, domain)
-    if (nrow(recs) > 0) recs$crawl_id <- cid
-    recs
-  }) |> bind_rows()
+  # Sample via TLD-based random pagination
+  records <- fetch_records_random(crawl_id, N_RANDOM_PAGES)
 
-  if (nrow(all_records) == 0) {
-    message("  No index records found.")
-    return(tibble(
-      year         = integer(),
-      domain       = character(),
-      crawl_id     = character(),
-      original_url = character(),
-      text         = character(),
-      fetch_status = character()
-    ))
+  if (length(records) == 0) {
+    message("  No index records found for year ", year, ".")
+    return(invisible(NULL))
   }
 
-  # Filter to successful HTML records that have WARC location info
+  # Convert to tibble and filter to HTML / status 200 with WARC location
+  df <- tryCatch(
+    bind_rows(lapply(records, as_tibble)),
+    error = function(e) tibble()
+  )
+
   required_cols <- c("filename", "offset", "length", "url")
-  has_required  <- all(required_cols %in% colnames(all_records))
+  if (!all(required_cols %in% colnames(df))) {
+    message("  [WARNING] Index records missing expected columns for year ", year)
+    return(invisible(NULL))
+  }
 
-  filtered <- if (has_required) {
-    all_records |>
-      filter(
-        !is.na(filename), !is.na(offset), !is.na(length),
-        if ("status" %in% colnames(all_records)) status == "200" else TRUE,
-        if ("mime"   %in% colnames(all_records)) str_detect(mime, "text/html") else TRUE
-      )
-  } else {
-    message("  [WARNING] Index records missing expected columns.")
-    tibble()
+  filtered <- df |>
+    filter(!is.na(filename), !is.na(offset), !is.na(length))
+
+  if ("status" %in% colnames(filtered)) {
+    filtered <- filtered |> filter(status == "200")
+  }
+  if ("mime" %in% colnames(filtered)) {
+    filtered <- filtered |> filter(str_detect(mime, "text/html"))
   }
 
   if (nrow(filtered) == 0) {
-    message("  No fetchable records after filtering.")
-    return(tibble(
-      year         = integer(),
-      domain       = character(),
-      crawl_id     = character(),
-      original_url = character(),
-      text         = character(),
-      fetch_status = character()
-    ))
+    message("  No fetchable records after filtering for year ", year, ".")
+    return(invisible(NULL))
   }
 
-  # Random sample across all available records
   sampled <- filtered |>
     slice_sample(n = min(SAMPLE_SIZE, nrow(filtered)))
 
   message("  Sampled ", nrow(sampled), " of ", nrow(filtered), " records.")
 
-  # Fetch WARC records and extract text
-  rows <- map(seq_len(nrow(sampled)), function(i) {
-    rec <- sampled[i, ]
-    original_url <- if ("url" %in% colnames(rec)) rec$url else NA_character_
-    crawl_id_val <- if ("crawl_id" %in% colnames(rec)) rec$crawl_id else crawl_ids[1]
+  for (i in seq_len(nrow(sampled))) {
+    rec          <- sampled[i, ]
+    original_url <- as.character(rec$url)
+    rec_crawl_id <- if ("crawl_id" %in% colnames(rec)) as.character(rec$crawl_id) else crawl_id
 
     message("  Fetching WARC: ", original_url)
 
     raw_bytes <- fetch_warc_record_bytes(rec$filename, rec$offset, rec$length)
 
     if (is.null(raw_bytes)) {
-      return(tibble(
-        year         = as.integer(year),
-        domain       = domain,
-        crawl_id     = as.character(crawl_id_val),
-        original_url = as.character(original_url),
-        text         = NA_character_,
-        fetch_status = "error: failed to fetch WARC bytes"
-      ))
+      fetch_status <- "error: failed to fetch WARC bytes"
+      text         <- NA_character_
+    } else {
+      html_string  <- parse_warc_html(raw_bytes)
+      text         <- extract_text_from_html(html_string)
+      fetch_status <- if (!is.na(text) && nzchar(text)) "success" else "error: empty text"
     }
 
-    html_string <- parse_warc_html(raw_bytes)
-    text        <- extract_text_from_html(html_string)
+    languages <- if ("languages" %in% colnames(rec)) as.character(rec$languages) else NA_character_
+    shard_id  <- if ("shard_id"  %in% colnames(rec)) as.integer(rec$shard_id)   else NA_integer_
 
-    fetch_status <- if (!is.na(text) && nzchar(text)) "success" else "error: empty text"
+    now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
 
-    tibble(
-      year         = as.integer(year),
-      domain       = domain,
-      crawl_id     = as.character(crawl_id_val),
-      original_url = as.character(original_url),
-      text         = text,
-      fetch_status = fetch_status
+    tryCatch(
+      dbExecute(con,
+        "INSERT OR IGNORE INTO commoncrawl_samples
+           (year, crawl_id, shard_id, original_url,
+            text, text_length, languages, fetch_status, collected_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params = list(
+          as.integer(year),
+          rec_crawl_id,
+          shard_id,
+          original_url,
+          text,
+          if (!is.na(text)) nchar(text) else NA_integer_,
+          languages,
+          fetch_status,
+          now
+        )
+      ),
+      error = function(e) message("  [DB INSERT ERROR]: ", conditionMessage(e))
     )
-  })
-
-  bind_rows(rows)
+  }
 }
 
 # -----------------------------------------------------------------------------
-# 3. Main collection loop
+# 5. Main
 # -----------------------------------------------------------------------------
 
-dir.create(OUTPUT_DIR,    showWarnings = FALSE, recursive = TRUE)
 dir.create(PROCESSED_DIR, showWarnings = FALSE, recursive = TRUE)
 
-message("=== Common Crawl data collection ===")
-message("Years:   ", min(YEARS), " - ", max(YEARS))
-message("Domains: ", paste(TARGET_DOMAINS, collapse = ", "))
-message("Sample size per year/domain: ", SAMPLE_SIZE)
-message("")
+con <- init_db()
+on.exit(dbDisconnect(con), add = TRUE)
 
-# Fetch the crawl index list once and reuse it
+# Fetch crawl index list once
 crawl_list <- get_crawl_index_list()
 message("Available crawl indexes: ", nrow(crawl_list))
+
+# Resume status summary
+completed_years <- dbGetQuery(con,
+  "SELECT year FROM commoncrawl_samples
+   WHERE fetch_status = 'success'
+   GROUP BY year
+   HAVING COUNT(*) >= ?",
+  params = list(SAMPLE_SIZE)
+)$year
+
+message("\n=== Common Crawl data collection ===")
+message("Years:   ", min(YEARS), " - ", max(YEARS))
+message("Sample size per year (total): ", SAMPLE_SIZE)
+message("Resuming: ", length(completed_years), " years already complete, ",
+        length(YEARS) - length(completed_years), " remaining.")
 message("")
 
-all_results <- map(YEARS, function(year) {
-  map(TARGET_DOMAINS, function(domain) {
-    collect_year_domain(year, domain, crawl_list)
-  }) |> bind_rows()
-}) |> bind_rows()
+for (year in YEARS) {
+  crawl_id <- find_crawl_for_year(crawl_list, year)
+
+  if (is.na(crawl_id)) {
+    message("No crawl index found for year ", year, "; skipping.")
+    next
+  }
+
+  collect_year(con, year, crawl_id)
+
+  # Per-year summary from DB
+  yr_stats <- dbGetQuery(con,
+    "SELECT
+       SUM(CASE WHEN fetch_status = 'success' THEN 1 ELSE 0 END) AS retrieved,
+       SUM(CASE WHEN fetch_status != 'success' THEN 1 ELSE 0 END) AS failures
+     FROM commoncrawl_samples WHERE year = ?",
+    params = list(year)
+  )
+  message("  Year ", year, " summary: ",
+          yr_stats$retrieved, " success, ", yr_stats$failures, " failures.")
+}
 
 # -----------------------------------------------------------------------------
-# 4. Save outputs
+# 6. Export
 # -----------------------------------------------------------------------------
 
 rds_path <- file.path(PROCESSED_DIR, "commoncrawl_sample.rds")
 csv_path <- file.path(PROCESSED_DIR, "commoncrawl_metadata.csv")
 
-saveRDS(all_results, rds_path)
+export_results(con, rds_path, csv_path)
+
 message("\nSaved full dataset to: ", rds_path)
-
-metadata <- all_results |> select(-text)
-write_csv(metadata, csv_path)
 message("Saved metadata to:     ", csv_path)
-
-# -----------------------------------------------------------------------------
-# 5. Summary
-# -----------------------------------------------------------------------------
-
-message("\n=== Collection Summary ===")
-
-summary_tbl <- all_results |>
-  group_by(year) |>
-  summarise(
-    retrieved = sum(fetch_status == "success"),
-    failures  = sum(fetch_status != "success"),
-    .groups   = "drop"
-  )
-
-print(summary_tbl, n = Inf)
-
-total_retrieved <- sum(summary_tbl$retrieved)
-total_failures  <- sum(summary_tbl$failures)
-
-message("\nTotal pages retrieved: ", total_retrieved)
-message("Total failures:        ", total_failures)
 message("Done.")

@@ -4,27 +4,28 @@
 # Collects web page text from the Wayback Machine (Internet Archive) CDX API.
 #
 # For each combination of year and domain, this script:
-#   1. Queries the CDX API for archived snapshots.
-#   2. Filters to successful HTML responses.
+#   1. Checks SQLite for already-collected samples (resume support).
+#   2. Queries the CDX API for archived snapshots.
 #   3. Randomly samples SAMPLE_SIZE URLs.
 #   4. Fetches the original page content using the id_ flag (no toolbar).
 #   5. Extracts plain text using rvest.
-#   6. Saves a combined tibble to data/processed/ (.rds and metadata .csv).
+#   6. Inserts each result immediately into SQLite.
 #
 # Usage (from project root):
 #   Rscript R/01-collect-wayback.R
 #
 # Output:
-#   data/raw/wayback/          Raw per-page text files (gitignored)
-#   data/processed/wayback_sample.rds        Full tibble with text
-#   data/processed/wayback_metadata.csv      Metadata without text column
+#   data/processed/web_archive_samples.db   SQLite database (shared with CC script)
+#   data/processed/wayback_sample.rds       Full tibble with text
+#   data/processed/wayback_metadata.csv     Metadata without text column
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # 0. Package checks
 # -----------------------------------------------------------------------------
 
-required_packages <- c("tidyverse", "httr2", "rvest", "jsonlite", "here")
+required_packages <- c("tidyverse", "httr2", "rvest", "jsonlite", "here",
+                       "DBI", "RSQLite")
 
 missing_packages <- required_packages[
   !sapply(required_packages, requireNamespace, quietly = TRUE)
@@ -46,15 +47,17 @@ suppressPackageStartupMessages({
   library(rvest)
   library(jsonlite)
   library(here)
+  library(DBI)
+  library(RSQLite)
 })
 
 # -----------------------------------------------------------------------------
 # 1. Configuration
 # -----------------------------------------------------------------------------
 
-SAMPLE_SIZE <- 1  # Number of random pages to retrieve per year per domain
+SAMPLE_SIZE <- 1  # Pages per year per domain
 
-set.seed(2026)    # For reproducibility of random sampling
+set.seed(2026)
 
 TARGET_DOMAINS <- c(
   "nytimes.com",
@@ -66,20 +69,92 @@ TARGET_DOMAINS <- c(
 
 YEARS <- 1996:2026
 
-OUTPUT_DIR <- here("data", "raw", "wayback")
-
 PROCESSED_DIR <- here("data", "processed")
 
+DB_PATH       <- here("data", "processed", "web_archive_samples.db")
 CDX_BASE_URL  <- "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE  <- "https://web.archive.org/web"
 
-DELAY_SECONDS <- 1  # Polite delay between HTTP requests
+DELAY_SECONDS <- 2  # Polite delay (configurable for multi-day runs)
 
 # -----------------------------------------------------------------------------
-# 2. Helper functions
+# 2. Database helpers
 # -----------------------------------------------------------------------------
 
-#' Safely parse HTML content string, avoiding xml2 path confusion.
+#' Open (or create) the shared SQLite database and ensure tables exist.
+#'
+#' @return A DBI connection object.
+init_db <- function() {
+  con <- dbConnect(SQLite(), DB_PATH)
+
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS wayback_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      timestamp TEXT,
+      original_url TEXT,
+      wayback_url TEXT,
+      text TEXT,
+      text_length INTEGER,
+      fetch_status TEXT NOT NULL,
+      collected_at TEXT,
+      UNIQUE(year, domain, timestamp, original_url)
+    )
+  ")
+
+  # Ensure the commoncrawl table also exists so both scripts share one DB
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS commoncrawl_samples (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year INTEGER NOT NULL,
+      crawl_id TEXT,
+      shard_id INTEGER,
+      original_url TEXT,
+      text TEXT,
+      text_length INTEGER,
+      languages TEXT,
+      fetch_status TEXT NOT NULL,
+      collected_at TEXT,
+      UNIQUE(year, crawl_id, original_url)
+    )
+  ")
+
+  con
+}
+
+#' Count successful samples already in the database for a year/domain pair.
+#'
+#' @param con     DBI connection
+#' @param year    Four-digit integer year
+#' @param domain  Domain string
+#' @return Integer count of successful rows.
+get_completed_count <- function(con, year, domain) {
+  dbGetQuery(con,
+    "SELECT COUNT(*) AS n FROM wayback_samples
+     WHERE year = ? AND domain = ? AND fetch_status = 'success'",
+    params = list(year, domain)
+  )$n
+}
+
+#' Export the wayback_samples table to RDS and CSV.
+#'
+#' @param con       DBI connection
+#' @param rds_path  Path for the .rds output
+#' @param csv_path  Path for the .csv output (text column excluded)
+export_results <- function(con, rds_path, csv_path) {
+  results <- dbGetQuery(con, "SELECT * FROM wayback_samples")
+  results_tbl <- as_tibble(results)
+  saveRDS(results_tbl, rds_path)
+  write_csv(select(results_tbl, -text), csv_path)
+  message("Exported ", nrow(results_tbl), " rows to RDS and CSV.")
+}
+
+# -----------------------------------------------------------------------------
+# 3. Fetch helpers
+# -----------------------------------------------------------------------------
+
+#' Safely parse an HTML content string, avoiding xml2 path confusion.
 #'
 #' @param content  Character string of raw HTML
 #' @return An xml_document, or NULL on failure.
@@ -94,14 +169,14 @@ safe_read_html <- function(content) {
   )
 }
 
-#' Query CDX API for snapshots of a domain within a given year.
+#' Query the CDX API for snapshots of a domain within a given year.
 #'
 #' @param domain  Domain to query, e.g. "nytimes.com"
 #' @param year    Four-digit integer year
 #' @return A tibble with columns: timestamp, original, statuscode, mimetype.
-#'         Returns an empty tibble on failure.
+#'         Returns an empty tibble on failure or no results.
 query_cdx <- function(domain, year) {
-  result <- tryCatch({
+  tryCatch({
     resp <- request(CDX_BASE_URL) |>
       req_url_query(
         url    = paste0(domain, "/*"),
@@ -145,8 +220,6 @@ query_cdx <- function(domain, year) {
     tibble(timestamp = character(), original = character(),
            statuscode = character(), mimetype = character())
   })
-
-  result
 }
 
 #' Fetch archived page content from the Wayback Machine.
@@ -154,13 +227,13 @@ query_cdx <- function(domain, year) {
 #' Uses the id_ modifier so the response is the original HTML without the
 #' Wayback Machine toolbar injected.
 #'
-#' @param timestamp  CDX timestamp string, e.g. "19961015120000"
-#' @param original_url  Original URL of the archived page
-#' @return A list with elements: text (character), fetch_status (character)
+#' @param timestamp    CDX timestamp string, e.g. "19961015120000"
+#' @param original_url Original URL of the archived page
+#' @return A list: wayback_url, text, fetch_status.
 fetch_wayback_page <- function(timestamp, original_url) {
   wayback_url <- paste0(WAYBACK_BASE, "/", timestamp, "id_/", original_url)
 
-  result <- tryCatch({
+  tryCatch({
     Sys.sleep(DELAY_SECONDS)
 
     resp <- request(wayback_url) |>
@@ -169,151 +242,151 @@ fetch_wayback_page <- function(timestamp, original_url) {
       req_retry(max_tries = 3, backoff = ~ 2) |>
       req_perform()
 
-    html_content <- resp_body_string(resp)
-
-    # Parse HTML and extract readable text
-    doc <- safe_read_html(html_content)
+    doc <- safe_read_html(resp_body_string(resp))
 
     if (is.null(doc)) {
-      return(list(
-        wayback_url  = wayback_url,
-        text         = NA_character_,
-        fetch_status = "error: HTML parse failed"
-      ))
+      return(list(wayback_url = wayback_url, text = NA_character_,
+                  fetch_status = "error: HTML parse failed"))
     }
 
-    # Remove script and style nodes before extracting text
     xml2::xml_remove(html_nodes(doc, "script"))
     xml2::xml_remove(html_nodes(doc, "style"))
+    text <- doc |> html_text2() |> str_squish()
 
-    text <- doc |>
-      html_text2() |>
-      str_squish()
-
-    list(
-      wayback_url  = wayback_url,
-      text         = text,
-      fetch_status = "success"
-    )
+    list(wayback_url = wayback_url, text = text, fetch_status = "success")
   }, error = function(e) {
     message("  [FETCH ERROR] ", wayback_url, ": ", conditionMessage(e))
-    list(
-      wayback_url  = wayback_url,
-      text         = NA_character_,
-      fetch_status = paste0("error: ", conditionMessage(e))
-    )
+    list(wayback_url = wayback_url, text = NA_character_,
+         fetch_status = paste0("error: ", conditionMessage(e)))
   })
-
-  result
 }
 
-#' Process one year/domain combination.
+# -----------------------------------------------------------------------------
+# 4. Per-combination collector (writes directly to DB)
+# -----------------------------------------------------------------------------
+
+#' Process one year/domain combination and insert results into SQLite.
 #'
+#' @param con     DBI connection
 #' @param year    Four-digit integer year
 #' @param domain  Domain string
-#' @return A tibble of results for this combination
-collect_year_domain <- function(year, domain) {
+collect_year_domain <- function(con, year, domain) {
+  # Resume check
+  already <- get_completed_count(con, year, domain)
+  if (already >= SAMPLE_SIZE) {
+    message("  Skipping ", domain, " ", year,
+            " (", already, " successful samples already in DB)")
+    return(invisible(NULL))
+  }
+
   message("Fetching year ", year, ", domain ", domain, "...")
 
-  # Step 1: query CDX
   snapshots <- query_cdx(domain, year)
 
-  # Step 2: filter to successful HTML pages
   filtered <- snapshots |>
-    filter(statuscode == "200",
-           str_detect(mimetype, "text/html"))
+    filter(statuscode == "200", str_detect(mimetype, "text/html"))
 
   if (nrow(filtered) == 0) {
     message("  No valid snapshots found.")
-    return(tibble(
-      year         = integer(),
-      domain       = character(),
-      timestamp    = character(),
-      original_url = character(),
-      wayback_url  = character(),
-      text         = character(),
-      fetch_status = character()
-    ))
+    return(invisible(NULL))
   }
 
-  # Step 3: random sample
   sampled <- filtered |>
     slice_sample(n = min(SAMPLE_SIZE, nrow(filtered)))
 
   message("  Sampled ", nrow(sampled), " of ", nrow(filtered), " snapshots.")
 
-  # Step 4: fetch each sampled page
-  rows <- map(seq_len(nrow(sampled)), function(i) {
+  for (i in seq_len(nrow(sampled))) {
     ts  <- sampled$timestamp[i]
     url <- sampled$original[i]
     message("  Fetching: ", url, " @ ", ts)
+
     fetched <- fetch_wayback_page(ts, url)
-    tibble(
+
+    row <- data.frame(
       year         = as.integer(year),
       domain       = domain,
       timestamp    = ts,
       original_url = url,
       wayback_url  = fetched$wayback_url,
       text         = fetched$text,
-      fetch_status = fetched$fetch_status
+      text_length  = if (!is.na(fetched$text)) nchar(fetched$text) else NA_integer_,
+      fetch_status = fetched$fetch_status,
+      stringsAsFactors = FALSE
     )
-  })
 
-  bind_rows(rows)
+    now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+
+    tryCatch(
+      dbExecute(con,
+        "INSERT OR IGNORE INTO wayback_samples
+           (year, domain, timestamp, original_url, wayback_url,
+            text, text_length, fetch_status, collected_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params = list(row$year, row$domain, row$timestamp, row$original_url,
+                      row$wayback_url, row$text, row$text_length,
+                      row$fetch_status, now)
+      ),
+      error = function(e) message("  [DB INSERT ERROR]: ", conditionMessage(e))
+    )
+  }
 }
 
 # -----------------------------------------------------------------------------
-# 3. Main collection loop
+# 5. Main
 # -----------------------------------------------------------------------------
 
-dir.create(OUTPUT_DIR,    showWarnings = FALSE, recursive = TRUE)
 dir.create(PROCESSED_DIR, showWarnings = FALSE, recursive = TRUE)
+
+con <- init_db()
+on.exit(dbDisconnect(con), add = TRUE)
+
+# Resume status summary
+completed_pairs <- dbGetQuery(con,
+  "SELECT year, domain FROM wayback_samples
+   WHERE fetch_status = 'success'
+   GROUP BY year, domain
+   HAVING COUNT(*) >= ?",
+  params = list(SAMPLE_SIZE)
+)
+total_pairs     <- length(YEARS) * length(TARGET_DOMAINS)
+completed_count <- nrow(completed_pairs)
 
 message("=== Wayback Machine data collection ===")
 message("Years:   ", min(YEARS), " - ", max(YEARS))
 message("Domains: ", paste(TARGET_DOMAINS, collapse = ", "))
 message("Sample size per year/domain: ", SAMPLE_SIZE)
+message("Resuming: ", completed_count, " year/domain pairs already complete, ",
+        total_pairs - completed_count, " remaining.")
 message("")
 
-all_results <- map(YEARS, function(year) {
-  map(TARGET_DOMAINS, function(domain) {
-    collect_year_domain(year, domain)
-  }) |> bind_rows()
-}) |> bind_rows()
+for (year in YEARS) {
+  year_results <- list()
+  for (domain in TARGET_DOMAINS) {
+    collect_year_domain(con, year, domain)
+  }
 
-# -----------------------------------------------------------------------------
-# 4. Save outputs
-# -----------------------------------------------------------------------------
-
-rds_path  <- file.path(PROCESSED_DIR, "wayback_sample.rds")
-csv_path  <- file.path(PROCESSED_DIR, "wayback_metadata.csv")
-
-saveRDS(all_results, rds_path)
-message("\nSaved full dataset to: ", rds_path)
-
-metadata <- all_results |> select(-text)
-write_csv(metadata, csv_path)
-message("Saved metadata to:     ", csv_path)
-
-# -----------------------------------------------------------------------------
-# 5. Summary
-# -----------------------------------------------------------------------------
-
-message("\n=== Collection Summary ===")
-
-summary_tbl <- all_results |>
-  group_by(year) |>
-  summarise(
-    retrieved = sum(fetch_status == "success"),
-    failures  = sum(fetch_status != "success"),
-    .groups   = "drop"
+  # Per-year summary from DB
+  yr_stats <- dbGetQuery(con,
+    "SELECT
+       SUM(CASE WHEN fetch_status = 'success' THEN 1 ELSE 0 END) AS retrieved,
+       SUM(CASE WHEN fetch_status != 'success' THEN 1 ELSE 0 END) AS failures
+     FROM wayback_samples WHERE year = ?",
+    params = list(year)
   )
+  message("  Year ", year, " summary: ",
+          yr_stats$retrieved, " success, ", yr_stats$failures, " failures.")
+}
 
-print(summary_tbl, n = Inf)
+# -----------------------------------------------------------------------------
+# 6. Export
+# -----------------------------------------------------------------------------
 
-total_retrieved <- sum(summary_tbl$retrieved)
-total_failures  <- sum(summary_tbl$failures)
+rds_path <- file.path(PROCESSED_DIR, "wayback_sample.rds")
+csv_path <- file.path(PROCESSED_DIR, "wayback_metadata.csv")
 
-message("\nTotal pages retrieved: ", total_retrieved)
-message("Total failures:        ", total_failures)
+export_results(con, rds_path, csv_path)
+
+message("\nSaved full dataset to: ", rds_path)
+message("Saved metadata to:     ", csv_path)
 message("Done.")

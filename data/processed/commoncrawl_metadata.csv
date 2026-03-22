@@ -1,4 +1,0 @@
-year,domain,crawl_id,original_url,fetch_status
-2008,cnn.com,CC-MAIN-2008-2009,http://www2.cnn.com/,success
-2018,cnn.com,CC-MAIN-2018-51,https://www.cnn.com/,error: empty text
-2024,cnn.com,CC-MAIN-2024-51,https://academy.cnn.com/home/?student-productions=a-quarter-lens,success
