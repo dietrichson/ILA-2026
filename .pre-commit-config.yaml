@@ -1,0 +1,59 @@
+# Pre-commit hooks for R/Quarto project
+# See https://pre-commit.com for more information
+
+repos:
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+        args: ['--unsafe']
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=5000']
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+      - id: trailing-whitespace
+        exclude: ^(.*\.md|.*\.qmd)$
+      - id: end-of-file-fixer
+        exclude: ^(.*\.md|.*\.qmd)$
+
+  # R code linting and styling via lorri (R pre-commit hooks)
+  - repo: https://github.com/lorenzwalthert/precommit
+    rev: v0.4.3
+    hooks:
+      - id: style-files
+        args: [--style_pkg=styler, --style_fun=tidyverse_style]
+      - id: lintr
+      - id: parsable-R
+      - id: no-browser-statement
+      - id: deps-in-desc
+
+  # Secret detection
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: |
+          (?x)^(
+            renv/.*|
+            data/.*|
+            .*\.lock|
+            .*\.RData
+          )$
+
+# Configuration
+exclude: |
+  (?x)^(
+    renv/.*|
+    data/raw/.*|
+    \.Rproj\.user/.*|
+    .*_files/.*|
+    .*_cache/.*|
+    \.DS_Store
+  )$
+
+default_stages: [pre-commit]
+fail_fast: false

@@ -1,0 +1,30 @@
+# Raw data (too large for git)
+data/raw/
+
+# R session files
+.Rhistory
+.Rdata
+.RData
+.Ruserdata
+.Rproj.user/
+
+# renv library (dependencies restored from lockfile)
+renv/library/
+renv/staging/
+renv/sandbox/
+
+# Quarto render artifacts
+*_files/
+*_cache/
+.quarto/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.Renviron
+
+# Firebase (not used)
+firebase-debug.log
