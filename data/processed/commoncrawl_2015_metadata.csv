@@ -184,6 +184,7 @@ id,year,crawl_id,shard_id,original_url,text_length,languages,fetch_status,collec
 6544,2015,CC-MAIN-2015-48,NA,http://forum.gazeta.ie/topic/56449-jaka-to-roslina/,17692,NA,success,2026-03-22 22:12:14
 7083,2015,CC-MAIN-2015-48,NA,http://forum.gazeta.ie/topic/63108-listopad-2010/page-70,14354,NA,success,2026-03-22 22:27:38
 6231,2015,CC-MAIN-2015-48,NA,http://forum.gazeta.ie/topic/77598-mecz-polska-irlandia/,8123,NA,success,2026-03-22 22:03:01
+8220,2015,CC-MAIN-2015-48,NA,http://forum.spring.io/forum/spring-projects/data/10971-hibernate-version-lastmoddate-aop-injected-how,1904,NA,success,2026-03-23 09:49:13
 7047,2015,CC-MAIN-2015-48,NA,http://fromearthsend.blogspot.co.nz/2009_07_01_archive.html,36308,NA,success,2026-03-22 22:26:37
 6991,2015,CC-MAIN-2015-48,NA,http://fromearthsend.blogspot.co.nz/2011/12/event-from-earths-end-xmas-drinks-2011.html,12418,NA,success,2026-03-22 22:25:03
 6226,2015,CC-MAIN-2015-48,NA,http://getthere.ie/cork-tralee/,6723,NA,success,2026-03-22 22:02:52
