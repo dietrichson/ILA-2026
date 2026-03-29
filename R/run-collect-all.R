@@ -294,22 +294,25 @@ collect_year <- function(con, year, crawl_id) {
 con <- open_db()
 on.exit(dbDisconnect(con), add = TRUE)
 
-collinfo <- NULL
-for (attempt in 1:5) {
-  collinfo <- tryCatch({
-    fromJSON(resp_body_string(
-      request("https://index.commoncrawl.org/collinfo.json") |>
-      req_timeout(60) |>
-      req_retry(max_tries = 3, backoff = ~ 10) |>
-      req_perform()))
-  }, error = function(e) {
-    message("collinfo.json attempt ", attempt, " failed: ", conditionMessage(e))
-    Sys.sleep(30)
-    NULL
-  })
-  if (!is.null(collinfo)) break
-}
-if (is.null(collinfo)) stop("Could not fetch collinfo.json after 5 attempts")
+# Hardcoded crawl IDs — avoids dependency on collinfo.json at startup.
+# One crawl per year (newest available). Update if new crawls are added.
+CRAWL_IDS <- c(
+  "2012" = "CC-MAIN-2012",
+  "2013" = "CC-MAIN-2013-48",
+  "2014" = "CC-MAIN-2014-52",
+  "2015" = "CC-MAIN-2015-48",
+  "2016" = "CC-MAIN-2016-50",
+  "2017" = "CC-MAIN-2017-51",
+  "2018" = "CC-MAIN-2018-51",
+  "2019" = "CC-MAIN-2019-51",
+  "2020" = "CC-MAIN-2020-50",
+  "2021" = "CC-MAIN-2021-49",
+  "2022" = "CC-MAIN-2022-49",
+  "2023" = "CC-MAIN-2023-50",
+  "2024" = "CC-MAIN-2024-51",
+  "2025" = "CC-MAIN-2025-51",
+  "2026" = "CC-MAIN-2026-12"
+)
 
 message("=== Collect All Years ===")
 message("Years: ", paste(YEARS, collapse = ", "))
@@ -318,7 +321,7 @@ message("TLD prefixes: ", length(URL_PREFIXES), " | Pages per TLD: ", PAGES_PER_
 message("")
 
 for (year in YEARS) {
-  crawl_id <- collinfo$id[str_detect(collinfo$id, paste0("CC-MAIN-", year))][1]
+  crawl_id <- CRAWL_IDS[as.character(year)]
   if (is.na(crawl_id)) { message("No crawl for ", year); next }
   collect_year(con, year, crawl_id)
 }
