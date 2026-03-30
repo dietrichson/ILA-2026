@@ -17,9 +17,10 @@ library(DBI)
 library(RSQLite)
 library(here)
 
-DB_PATH <- here("data", "processed", "web_archive_samples.db")
+DB_PATH          <- here("data", "processed", "web_archive_samples.db")
+DB_PATH_WEIGHTED <- here("data", "processed", "web_archive_weighted.db")
 
-#' Open the shared SQLite database, creating tables if needed.
+#' Open the equal-weight SQLite database, creating tables if needed.
 #'
 #' @return A DBI connection object. Caller is responsible for disconnecting.
 open_db <- function() {
@@ -36,6 +37,22 @@ open_db <- function() {
   dbExecute(con, "CREATE TABLE IF NOT EXISTS commoncrawl_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT, year INTEGER NOT NULL,
     crawl_id TEXT, shard_id INTEGER, original_url TEXT, text TEXT,
+    text_length INTEGER, languages TEXT, fetch_status TEXT NOT NULL,
+    collected_at TEXT, UNIQUE(year, crawl_id, original_url))")
+
+  con
+}
+
+#' Open the proportionally weighted SQLite database, creating table if needed.
+#'
+#' @return A DBI connection object. Caller is responsible for disconnecting.
+open_weighted_db <- function() {
+  dir.create(dirname(DB_PATH_WEIGHTED), showWarnings = FALSE, recursive = TRUE)
+  con <- dbConnect(SQLite(), DB_PATH_WEIGHTED)
+
+  dbExecute(con, "CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, year INTEGER NOT NULL,
+    crawl_id TEXT, original_url TEXT, tld_prefix TEXT, text TEXT,
     text_length INTEGER, languages TEXT, fetch_status TEXT NOT NULL,
     collected_at TEXT, UNIQUE(year, crawl_id, original_url))")
 
@@ -80,12 +97,43 @@ read_wb_samples <- function(con, years = NULL) {
   tibble::as_tibble(dbGetQuery(con, query, params = params))
 }
 
+#' Read successful weighted samples for given years.
+#'
+#' @param con   DBI connection from open_weighted_db()
+#' @param years Integer vector of years (default: all years)
+#' @return A tibble with all columns from the samples table.
+read_weighted_samples <- function(con, years = NULL) {
+  if (is.null(years)) {
+    query <- "SELECT * FROM samples WHERE fetch_status = 'success'"
+    params <- list()
+  } else {
+    placeholders <- paste(rep("?", length(years)), collapse = ", ")
+    query <- paste0(
+      "SELECT * FROM samples WHERE fetch_status = 'success' AND year IN (",
+      placeholders, ")")
+    params <- as.list(as.integer(years))
+  }
+  tibble::as_tibble(dbGetQuery(con, query, params = params))
+}
+
 #' Summary counts per year for a given table.
 #'
 #' @param con   DBI connection
-#' @param table "commoncrawl_samples" or "wayback_samples"
+#' @param table Table name. Auto-detected from connection if NULL:
+#'              "commoncrawl_samples" for equal-weight DB,
+#'              "samples" for weighted DB.
 #' @return A tibble with year, success, fail columns.
-db_summary <- function(con, table = "commoncrawl_samples") {
+db_summary <- function(con, table = NULL) {
+  if (is.null(table)) {
+    tables <- dbListTables(con)
+    table <- if ("samples" %in% tables && !"commoncrawl_samples" %in% tables) {
+      "samples"
+    } else if ("commoncrawl_samples" %in% tables) {
+      "commoncrawl_samples"
+    } else {
+      stop("No recognized sample table found in database")
+    }
+  }
   tibble::as_tibble(dbGetQuery(con, paste0(
     "SELECT year,
             SUM(CASE WHEN fetch_status = 'success' THEN 1 ELSE 0 END) AS success,
