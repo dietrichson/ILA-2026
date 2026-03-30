@@ -153,8 +153,9 @@ get_tld_weights <- function(crawl_id, target) {
     proportion <- pc / grand_total
     alloc <- max(1, round(target * proportion))
     # How many index pages to fetch: each gives ~10-15K records
-    # Fetch proportionally but ensure minimum of 2 for large TLDs (reliability)
-    n_fetch <- max(2, ceiling(alloc / 200))
+    # For *.com (74%+ of target), fetch more pages for reliability since
+    # individual page fetches often time out due to large response size
+    n_fetch <- if (proportion > 0.5) 8 else max(2, ceiling(alloc / 200))
     n_fetch <- min(n_fetch, pc)  # don't exceed available
     result[[prefix]] <- list(pages = pc, alloc = alloc, n_fetch = n_fetch,
                               pct = round(proportion * 100, 1))
@@ -208,8 +209,8 @@ collect_year <- function(con, year, crawl_id) {
           req_url_query(url = pfx, output = "json", page = pg,
                         filter = "mime:text/html", filter = "status:200",
                         .multi = "explode") |>
-          req_timeout(60) |>
-          req_retry(max_tries = 2, backoff = ~ 2) |>
+          req_timeout(120) |>
+          req_retry(max_tries = 3, backoff = ~ 5) |>
           req_headers("User-Agent" = "ILA2026-Research/1.0 (academic research)") |>
           req_perform()
         lines <- str_split(str_trim(resp_body_string(resp)), "\n")[[1]]
@@ -217,10 +218,17 @@ collect_year <- function(con, year, crawl_id) {
         parsed <- compact(lapply(lines, function(l) tryCatch(fromJSON(l), error = function(e) NULL)))
         # Tag each record with its TLD prefix
         lapply(parsed, function(r) { r$tld_prefix <- pfx; r })
-      }, error = function(e) list())
+      }, error = function(e) {
+        message("    [", pfx, " page ", pg, " failed]")
+        list()
+      })
       all_records <- c(all_records, recs)
     }
-    message("  ", pfx, " fetched ", w$n_fetch, " pages (candidates: ", length(all_records), ")")
+
+    # Check if we got enough for this TLD's allocation
+    pfx_count <- sum(sapply(all_records, function(r) identical(r$tld_prefix, pfx)))
+    message("  ", pfx, " fetched ", w$n_fetch, " pages -> ", pfx_count,
+            " records (need ~", w$alloc * 3, " candidates)")
   }
 
   message("\nRaw candidates: ", length(all_records))
@@ -259,10 +267,21 @@ collect_year <- function(con, year, crawl_id) {
     params = list(year))$original_url
   df <- df |> filter(!(url %in% existing))
 
-  # ----- Step 4: Sample from the full pool -----
-  # The TLD weighting is already enforced by how many candidates each TLD
-  # contributed (proportional index page fetches). Just oversample from pool.
-  sampled <- slice_sample(df, n = min(need * 2, nrow(df)))
+  # ----- Step 4: Sample proportionally by TLD from capped pool -----
+  # After domain cap, small TLDs retain disproportionate share.
+  # Re-enforce proportional allocation at sampling time.
+  sampled_parts <- list()
+  for (pfx in names(weights)) {
+    w <- weights[[pfx]]
+    pfx_rows <- df |> filter(tld_prefix == pfx)
+    # Take alloc * 2 (oversample for failures), but don't exceed available
+    n_take <- min(w$alloc * 2, nrow(pfx_rows))
+    if (n_take > 0) {
+      sampled_parts[[pfx]] <- slice_sample(pfx_rows, n = n_take)
+    }
+  }
+  sampled <- bind_rows(sampled_parts)
+  sampled <- sampled[sample(nrow(sampled)), ]  # shuffle
 
   message("Fetching up to ", nrow(sampled), " (stopping at ", need, " successes)\n")
 
