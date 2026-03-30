@@ -67,7 +67,7 @@ open_weighted_db <- function() {
 read_cc_samples <- function(con, years = NULL) {
   if (is.null(years)) {
     query <- "SELECT * FROM commoncrawl_samples WHERE fetch_status = 'success'"
-    params <- list()
+    return(tibble::as_tibble(dbGetQuery(con, query)))
   } else {
     placeholders <- paste(rep("?", length(years)), collapse = ", ")
     query <- paste0(
@@ -86,7 +86,7 @@ read_cc_samples <- function(con, years = NULL) {
 read_wb_samples <- function(con, years = NULL) {
   if (is.null(years)) {
     query <- "SELECT * FROM wayback_samples WHERE fetch_status = 'success'"
-    params <- list()
+    return(tibble::as_tibble(dbGetQuery(con, query)))
   } else {
     placeholders <- paste(rep("?", length(years)), collapse = ", ")
     query <- paste0(
@@ -105,7 +105,7 @@ read_wb_samples <- function(con, years = NULL) {
 read_weighted_samples <- function(con, years = NULL) {
   if (is.null(years)) {
     query <- "SELECT * FROM samples WHERE fetch_status = 'success'"
-    params <- list()
+    return(tibble::as_tibble(dbGetQuery(con, query)))
   } else {
     placeholders <- paste(rep("?", length(years)), collapse = ", ")
     query <- paste0(
