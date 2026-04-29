@@ -1,0 +1,58 @@
+---
+title: "LLM-autocorprophagy"
+subtitle: "Predictions, retrodictions and prognoses of LLMs’ impact on written language."
+author: "Aleksander Dietrichson, PhD"
+format: revealjs
+editor: visual
+---
+
+## 
+
+```{r}
+#| include: false
+library(tidytext)
+library(tidyverse)
+source(here::here("R","00-db-helpers.R"))
+con <- dbConnect(SQLite(), DB_PATH)
+my_data <- read_cc_samples(con)
+```
+
+## Disclaimer & Reverse Disclaimer
+
+-   *Claude code* was used to generate the source code for data collection and for running the experiment as reported.
+
+-   No AI tools were used in the creation of this presentation. R and quarto code for data analysis written exclusively written by the author[^1].
+
+-   Source-code, AI prompts and data available at: <https://github.com/dietrichson/ILA-2026>
+
+[^1]: With the exception of spell-checker.
+
+## How LLMs Work
+
+## Experiment 
+
+```{r}
+
+my_filename <- here::here("data/articles/new_yorker_1.txt")
+my_text <- readLines(my_filename)
+text_df <- tibble(line = 1:length(my_text), text = my_text)
+text_df |> 
+  unnest_tokens(word,text) |> 
+  nrow()
+
+text_df |> 
+  unnest_tokens(word, text) |> 
+  count(word, sort = TRUE) |> 
+  nrow()
+
+my_filename <- here::here("data/articles/new_yorker_1_expanded.txt")
+my_text <- readLines(my_filename)
+text_df <- tibble(line = 1:length(my_text), text = my_text)
+text_df |> 
+  unnest_tokens(word, text) |> 
+  count(word, sort = TRUE) |> 
+  nrow()
+
+```
+
+## Empirical Exploration
