@@ -4,6 +4,7 @@ subtitle: "Predictions, retrodictions and prognoses of LLMs’ impact on written
 author: "Aleksander Dietrichson, PhD"
 format: revealjs
 editor: visual
+output-dir: "docs"
 ---
 
 
