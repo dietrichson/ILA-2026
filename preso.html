@@ -142,28 +142,105 @@ Aleksander Dietrichson, PhD
 </div>
 
 </section>
-<section id="section" class="slide level2">
-<h2></h2>
-</section>
 <section id="disclaimer-reverse-disclaimer" class="slide level2">
 <h2>Disclaimer &amp; Reverse Disclaimer</h2>
 <ul>
-<li><p>Claude code was used to generate the source code for data collection.</p></li>
-<li><p>Claude is used in the experimental research as reported</p></li>
+<li><p><em>Claude code</em> was used to generate the source code for data collection and for running the experiment as reported.</p></li>
 <li><p>No AI tools were used in the creation of this presentation. R and quarto code for data analysis written exclusively written by the author<sup>1</sup>.</p></li>
 <li><p>Source-code, AI prompts and data available at: <a href="https://github.com/dietrichson/ILA-2026" class="uri">https://github.com/dietrichson/ILA-2026</a></p></li>
 </ul>
 <aside><ol class="aside-footnotes"><li id="fn1"><p>With the exception of spell-checker.</p></li></ol></aside></section>
 <section id="how-llms-work" class="slide level2">
-<h2>How LLMs work</h2>
+<h2>How LLMs Work</h2>
 </section>
-<section id="experiment" class="slide level2">
-<h2>Experiment</h2>
+<section id="experiment-data" class="slide level2">
+<h2>Experiment: Data</h2>
+<ul>
+<li><p>Five articles, 1600-2200 words each.</p></li>
+<li><p>One from the <em>New Yorker</em> four from the <em>New York Times</em>.</p></li>
+<li><p>Chosen for length, from the latest edition of each publication (last week of april 2026)</p></li>
+</ul>
 </section>
-<section id="emprirical-exploration" class="slide level2">
-<h2>Emprirical Exploration</h2>
+<section id="experiment-method" class="slide level2">
+<h2>Experiment: Method</h2>
+<h3 id="step-1-summarization-task">Step 1: Summarization task</h3>
+<p>This is the text of an published article. Your task is to summarize this. Aim for 500 words. The output filename should have the same name as the input-file with “_summary” interjected.</p>
+<h3 id="step-2-expansion-task">Step 2: Expansion task</h3>
+<p>This is a short article, we would like to make it longer. Please add verbiage so that the article is around 1600 words long. The output filename should be the same as the input-file with “_expanded” instead of “_summary”</p>
+</section>
+<section id="experiment-aparatus" class="slide level2">
+<h2>Experiment: Aparatus</h2>
+<p>Claude code was used, with Opus 4.7</p>
+</section>
+<section id="results" class="slide level2">
+<h2>Results</h2>
+<div class="cell">
+<div class="cell-output-display">
+<table class="caption-top">
+<thead>
+<tr class="header">
+<th style="text-align: left;">Publication</th>
+<th style="text-align: right;">Original</th>
+<th style="text-align: right;">Processed</th>
+<th style="text-align: left;">Loss</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">New Yorker</td>
+<td style="text-align: right;">792</td>
+<td style="text-align: right;">753</td>
+<td style="text-align: left;">4.9%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">New York Times 1</td>
+<td style="text-align: right;">818</td>
+<td style="text-align: right;">690</td>
+<td style="text-align: left;">15.6%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">New York Times 2</td>
+<td style="text-align: right;">992</td>
+<td style="text-align: right;">741</td>
+<td style="text-align: left;">25.3%</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">New York Times 3</td>
+<td style="text-align: right;">820</td>
+<td style="text-align: right;">640</td>
+<td style="text-align: left;">22.0%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">New York Times 4</td>
+<td style="text-align: right;">921</td>
+<td style="text-align: right;">677</td>
+<td style="text-align: left;">26.5%</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<p>Average loss is 19%</p>
+</section>
+<section id="results-1" class="slide level2">
+<h2>Results</h2>
 
+<img data-src="preso_files/figure-revealjs/unnamed-chunk-3-1.png" width="960" class="r-stretch"></section>
+<section id="emprirical-research" class="slide level2">
+<h2>Emprirical Research</h2>
+<ul>
+<li>Random sample of 15 thousand webpages</li>
+<li>Retrieved from https://commoncrawl.org/</li>
+<li>English language</li>
+<li>1000 from each of the years 2012 through 2026</li>
+<li>Calculated Type/Token ratio for each document</li>
+</ul>
 </section>
+<section id="results-2" class="slide level2">
+<h2>Results</h2>
+
+
+<img data-src="preso_files/figure-revealjs/median_TRR-1.png" width="960" class="r-stretch quarto-figure-center"><p class="caption">Mediar TRR over Year</p></section>
 
     </div>
   <div class="quarto-auto-generated-content" style="display: none;">

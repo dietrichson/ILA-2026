@@ -6,13 +6,13 @@ format: revealjs
 editor: visual
 ---
 
-## 
 
 ```{r}
 #| include: false
 library(tidytext)
 library(tidyverse)
 source(here::here("R","00-db-helpers.R"))
+source(here::here("R/unique_word_count.R"))
 con <- dbConnect(SQLite(), DB_PATH)
 my_data <- read_cc_samples(con)
 ```
@@ -29,30 +29,140 @@ my_data <- read_cc_samples(con)
 
 ## How LLMs Work
 
-## Experiment 
+## Experiment: Data
+
+
+-   Five articles, 1600-2200 words each.
+
+-   One from the *New Yorker* four from the *New York Times*.
+
+-   Chosen for length, from the latest edition of each publication (last week of april 2026)
+
+## Experiment: Method
+
+### Step 1: Summarization task
+
+This is the text of an published article. Your task is to summarize this. Aim for 500 words.
+The output filename should have the same name as the input-file with "_summary" interjected.
+
+### Step 2: Expansion task
+
+This is a short article, we would like to make it longer. Please add verbiage so that the article is around 1600 words long.
+The output filename should be the same as the input-file with "_expanded" instead of "_summary"
+
+## Experiment: Aparatus
+
+
+Claude code was used, with Opus 4.7 
+
+
+## Results
 
 ```{r}
+#| echo: false
+#| 
+publication_names <- c("New Yorker", "New York Times 1", "New York Times 2", "New York Times 3", "New York Times 4")
+my_filenames_origininal <- c(
+  here::here("data/articles/new_yorker_1.txt"),
+  here::here("data/articles/nyt_1.txt"),
+  here::here("data/articles/nyt_2.txt"),
+  here::here("data/articles/nyt_3.txt"),
+  here::here("data/articles/nyt_4.txt")
+)
+my_filenames_summary <- c(
+  here::here("data/articles/new_yorker_1_summary.txt"),
+  here::here("data/articles/nyt_1_summary.txt"),
+  here::here("data/articles/nyt_2_summary.txt"),
+  here::here("data/articles/nyt_3_summary.txt"),
+  here::here("data/articles/nyt_4_summary.txt")
+)
+my_filenames_expanded <- c(
+  here::here("data/articles/new_yorker_1_expanded.txt"),
+  here::here("data/articles/nyt_1_expanded.txt"),
+  here::here("data/articles/nyt_2_expanded.txt"),
+  here::here("data/articles/nyt_3_expanded.txt"),
+  here::here("data/articles/nyt_4_expanded.txt")
+)
 
-my_filename <- here::here("data/articles/new_yorker_1.txt")
-my_text <- readLines(my_filename)
-text_df <- tibble(line = 1:length(my_text), text = my_text)
-text_df |> 
-  unnest_tokens(word,text) |> 
-  nrow()
+my_data_experiment <- data.frame(
+  Publication = publication_names,
+  original = purrr::map_dbl(my_filenames_origininal, unique_word_count),
+  summary = purrr::map_dbl(my_filenames_summary, unique_word_count),
+  expanded = purrr::map_dbl(my_filenames_expanded, unique_word_count)
+)
 
-text_df |> 
-  unnest_tokens(word, text) |> 
-  count(word, sort = TRUE) |> 
-  nrow()
+loss <- my_data_experiment$original - my_data_experiment$expanded 
+loss <- loss/my_data_experiment$original
 
-my_filename <- here::here("data/articles/new_yorker_1_expanded.txt")
-my_text <- readLines(my_filename)
-text_df <- tibble(line = 1:length(my_text), text = my_text)
-text_df |> 
-  unnest_tokens(word, text) |> 
-  count(word, sort = TRUE) |> 
-  nrow()
+
+my_data_experiment$Loss <- scales::percent(loss)
+my_data_experiment |> 
+  select(-summary) |> 
+  knitr::kable(col.names = c("Publication", "Original", "Processed", "Loss"))
 
 ```
 
-## Empirical Exploration
+Average loss is `r scales::percent(mean(loss))`
+
+## Results
+
+```{r}
+my_data_experiment |> 
+  select(Publication, original, expanded) |> 
+  pivot_longer(cols = c(original, expanded)) |> 
+  ggplot(aes(name, value, color = Publication, group = Publication)) +
+  geom_point() +
+  geom_line() +
+  scale_x_discrete(limits = c("original", "expanded"))
+```
+
+## Empirical Research
+
+-  Random sample of 15 thousand webpages
+-  Retrieved from https://commoncrawl.org/
+-  English language
+-  1000 from each of the years 2012 through 2026
+-  Calculated Type/Token ratio for each document
+
+```{r}
+my_data_tokenized <- my_data |>
+  unnest_tokens(word, text)
+  
+# Get unique words per year
+# my_data_tokenized |> 
+#   group_by(year) |> 
+#   summarize(
+#     n_words = n_distinct(word)
+#   )
+
+
+TTRS <- my_data_tokenized |>
+  group_by(id, year) |>
+  summarize(
+    n_tokens = n(),
+    n_types  = n_distinct(word),
+    ttr      = n_types / n_tokens
+  )
+
+
+```
+
+## Results
+
+
+
+```{r}
+#| label: "median_TRR"
+#| fig-cap: "Median TRR over Year"
+
+TTRS |> 
+  group_by(year) |> 
+  summarize(
+    Median = median(ttr)
+  ) |> 
+  ggplot(aes(year,Median))+
+  geom_point()+
+  geom_line()+
+  geom_smooth(method = "lm")
+```
+
