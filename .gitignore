@@ -31,3 +31,6 @@ Thumbs.db
 
 # Firebase (not used)
 firebase-debug.log
+
+/.quarto/
+**/*.quarto_ipynb

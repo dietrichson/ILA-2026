@@ -2,9 +2,12 @@
 title: "LLM-autocorprophagy"
 subtitle: "Predictions, retrodictions and prognoses of LLMs’ impact on written language."
 author: "Aleksander Dietrichson, PhD"
-format: revealjs
+format: 
+  revealjs:
+    self-contained: true
+  beamer: default
+output-file: index
 editor: visual
-output-dir: "docs"
 ---
 
 
@@ -30,8 +33,29 @@ my_data <- read_cc_samples(con)
 
 ## How LLMs Work
 
-## Experiment: Data
+```{mermaid}
+flowchart TD
+    A[Scrape Internet] --> B[Compression/Vectorization]
+    B --> E[Model Training ]
+    E --> F[Model Weights]
+    F --prompt--> G[Output]
+```
 
+## The Problem
+
+When most training data for LLMs is the output of other LLMs a loop is created
+
+```{mermaid}
+flowchart TD
+    A[Scrape Internet] --> B[Compression/Vectorization]
+    B --> E[Model Training ]
+    E --> F[Model Weights]
+    F --prompt: create web content--> G[Output]
+    G -- becomes training data --> A
+```
+
+
+## Experiment: Data
 
 -   Five articles, 1600-2200 words each.
 
@@ -53,15 +77,15 @@ The output filename should be the same as the input-file with "_expanded" instea
 
 ## Experiment: Aparatus
 
-
-Claude code was used, with Opus 4.7 
+-  Claude code was used, with Opus 4.7 
 
 
 ## Results
 
 ```{r}
 #| echo: false
-#| 
+#| label: loss_table
+#| tbl-cap: "Unique words (types) per condition"
 publication_names <- c("New Yorker", "New York Times 1", "New York Times 2", "New York Times 3", "New York Times 4")
 my_filenames_origininal <- c(
   here::here("data/articles/new_yorker_1.txt"),
@@ -108,6 +132,8 @@ Average loss is `r scales::percent(mean(loss))`
 ## Results
 
 ```{r}
+#| label: loss_fig
+#| fig-cap: "Unique words (types) per condition"
 my_data_experiment |> 
   select(Publication, original, expanded) |> 
   pivot_longer(cols = c(original, expanded)) |> 
@@ -142,15 +168,22 @@ TTRS <- my_data_tokenized |>
   summarize(
     n_tokens = n(),
     n_types  = n_distinct(word),
-    ttr      = n_types / n_tokens
+    ttr      = n_types / n_tokens,
+    avg_word_length = mean(nchar(word), na.rm = TRUE)
   )
 
 
 ```
 
+## Type Token Ratio
+
+$$ 
+TTR = {\text{number of unique words} \over {\text{total number of words}}}
+$$
+
+A measure of *Vocabulary diversity* in text
+
 ## Results
-
-
 
 ```{r}
 #| label: "median_TRR"
@@ -164,6 +197,72 @@ TTRS |>
   ggplot(aes(year,Median))+
   geom_point()+
   geom_line()+
-  geom_smooth(method = "lm")
+  geom_smooth(method = "lm") -> my_plot
+
+my_plot
 ```
+
+## Results
+
+```{r}
+#| label: "mean_word_length"
+#| fig-cap: "Mean Length of Words Over Year"
+
+TTRS |> 
+  group_by(year) |> 
+  summarize(
+    Mean = mean(avg_word_length)
+  ) |> 
+  ggplot(aes(year,Mean))+
+   geom_point()+
+   geom_line()+
+  geom_smooth(method = "lm", se = FALSE, fullrange = TRUE) -> my_plot2
+my_plot2
+```
+
+
+## Results
+
+```{r}
+#| include: false
+TTRS |> 
+  group_by(year) |> 
+  summarize(
+    Median = median(ttr)
+  ) |> 
+  mutate(change = lag(Median)-Median) -> tmp
+TTRS |> 
+  group_by(year) |> 
+  summarize(
+    Mean = mean(avg_word_length)
+  ) |> mutate(change = Mean - lag(Mean)) -> tmp2
+```
+
+-  Type/Token ratio drops by `r mean(tmp$change, na.rm = TRUE)` (~ .8%) anually.
+-  Word-length increases by `r tmp2$change |> mean(na.rm=TRUE)` character per word anually.
+
+## Projections
+
+```{r}
+#| label: "mean_types"
+#| fig-cap: "Mean Types (Raw Scores)"
+TTRS |> 
+  group_by(year) |> 
+  summarize(
+    Types = mean(n_types)
+  ) |> 
+  ggplot(aes(year,Types))+
+  # geom_point()+
+  # geom_line()+
+  geom_smooth(method = "lm", se=FALSE, fullrange=TRUE) -> my_plot
+my_plot + 
+  scale_x_continuous(limits = c(1900, 2200))
+```
+
+## Conclusions
+
+-  Linguistic diversity is under preassure. 
+-  "AI slop" seems omnipresent and still feature recognizable characteristics
+
+
 
